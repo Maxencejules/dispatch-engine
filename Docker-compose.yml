@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:16
+    container_name: dispatch_engine_db
+    environment:
+      POSTGRES_DB: dispatch
+      POSTGRES_USER: dispatch
+      POSTGRES_PASSWORD: dispatch
+    ports:
+      - "5432:5432"
+    volumes:
+      - dispatch_engine_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dispatch -d dispatch"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  dispatch_engine_pgdata:
