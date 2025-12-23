@@ -1,6 +1,5 @@
 from datetime import datetime
-from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 # -------- Couriers --------
@@ -17,15 +16,14 @@ class CourierUpdateLocation(BaseModel):
 
 
 class CourierResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     status: str
     lat: float
     lng: float
     capacity: int
     last_seen_at: datetime
-
-    class Config:
-        from_attributes = True
 
 
 # -------- Orders --------
@@ -38,6 +36,8 @@ class OrderCreate(BaseModel):
 
 
 class OrderResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     status: str
     pickup_lat: float
@@ -45,6 +45,3 @@ class OrderResponse(BaseModel):
     dropoff_lat: float
     dropoff_lng: float
     created_at: datetime
-
-    class Config:
-        from_attributes = True
