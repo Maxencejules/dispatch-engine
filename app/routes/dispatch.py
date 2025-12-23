@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -11,20 +12,34 @@ router = APIRouter(prefix="/dispatch", tags=["dispatch"])
 
 @router.post("/match")
 def match_order(order_id: str, db: Session = Depends(get_db)):
-    order = db.get(Order, order_id)
+    # Lock the order row to prevent races
+    order = db.execute(
+        select(Order).where(Order.id == order_id).with_for_update()
+    ).scalar_one_or_none()
+
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    if order.status != OrderStatus.unassigned:
-        raise HTTPException(status_code=409, detail="Order already assigned or not eligible")
+    # Idempotency: return existing assignment if already assigned
+    existing = db.execute(
+        select(Assignment).where(Assignment.order_id == order.id)
+    ).scalar_one_or_none()
 
-    # Gather candidate couriers
+    if existing:
+        return {
+            "order_id": existing.order_id,
+            "courier_id": existing.courier_id,
+            "assignment_id": existing.id,
+            "score": existing.score,
+            "idempotent": True,
+        }
+
+    if order.status != OrderStatus.unassigned:
+        raise HTTPException(status_code=409, detail="Order not eligible for assignment")
+
     couriers = db.execute(
         select(Courier).where(Courier.status == CourierStatus.available)
     ).scalars().all()
-
-    if not couriers:
-        raise HTTPException(status_code=409, detail="No available couriers")
 
     best = None
     best_meta = None
@@ -34,7 +49,6 @@ def match_order(order_id: str, db: Session = Depends(get_db)):
             select(func.count(Assignment.id)).where(Assignment.courier_id == c.id)
         ).scalar_one()
 
-        # capacity guard
         if active_count >= c.capacity:
             continue
 
@@ -52,27 +66,43 @@ def match_order(order_id: str, db: Session = Depends(get_db)):
             best = c
             best_meta = {"score": score, "explain": explain}
 
-    if best is None:
-        raise HTTPException(status_code=409, detail="No couriers under capacity")
+    if not best:
+        raise HTTPException(status_code=409, detail="No couriers available")
 
     assignment = Assignment(
         order_id=order.id,
         courier_id=best.id,
         score=best_meta["score"],
-        reason=f"min_score distance_km={best_meta['explain']['distance_km']:.3f} load_ratio={best_meta['explain']['load_ratio']:.2f} staleness_min={best_meta['explain']['staleness_min']:.2f}",
+        reason="transactional_min_score",
     )
 
     order.status = OrderStatus.assigned
     best.status = CourierStatus.assigned
 
-    db.add(assignment)
-    db.commit()
+    try:
+        db.add(assignment)
+        db.commit()
+    except IntegrityError:
+        # Another request won the race → idempotent response
+        db.rollback()
+        winner = db.execute(
+            select(Assignment).where(Assignment.order_id == order.id)
+        ).scalar_one()
+        return {
+            "order_id": winner.order_id,
+            "courier_id": winner.courier_id,
+            "assignment_id": winner.id,
+            "score": winner.score,
+            "idempotent": True,
+        }
+
     db.refresh(assignment)
 
     return {
-        "order_id": order.id,
-        "courier_id": best.id,
+        "order_id": assignment.order_id,
+        "courier_id": assignment.courier_id,
         "assignment_id": assignment.id,
         "score": assignment.score,
         "explain": best_meta["explain"],
+        "idempotent": False,
     }
