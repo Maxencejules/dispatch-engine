@@ -1,23 +1,35 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.db import get_db
-from app.models import Assignment, Courier, CourierStatus, Order, OrderStatus
 from app.algorithms.scoring import courier_score
+from app.db import get_db
+from app.metrics import dispatch_attempts, dispatch_failure, dispatch_success
+from app.models import Assignment, Courier, CourierStatus, Order, OrderStatus
 
 router = APIRouter(prefix="/dispatch", tags=["dispatch"])
+logger = logging.getLogger("dispatch")
 
 
 @router.post("/match")
 def match_order(order_id: str, db: Session = Depends(get_db)):
+    dispatch_attempts.inc()
+    logger.info("dispatch_attempt", extra={"order_id": order_id})
+
     # Lock the order row to prevent races
     order = db.execute(
         select(Order).where(Order.id == order_id).with_for_update()
     ).scalar_one_or_none()
 
     if not order:
+        dispatch_failure.inc()
+        logger.info(
+            "dispatch_failure",
+            extra={"order_id": order_id, "reason": "order_not_found"},
+        )
         raise HTTPException(status_code=404, detail="Order not found")
 
     # Idempotency: return existing assignment if already assigned
@@ -26,6 +38,14 @@ def match_order(order_id: str, db: Session = Depends(get_db)):
     ).scalar_one_or_none()
 
     if existing:
+        logger.info(
+            "dispatch_idempotent_hit",
+            extra={
+                "order_id": existing.order_id,
+                "courier_id": existing.courier_id,
+                "assignment_id": existing.id,
+            },
+        )
         return {
             "order_id": existing.order_id,
             "courier_id": existing.courier_id,
@@ -35,6 +55,11 @@ def match_order(order_id: str, db: Session = Depends(get_db)):
         }
 
     if order.status != OrderStatus.unassigned:
+        dispatch_failure.inc()
+        logger.info(
+            "dispatch_failure",
+            extra={"order_id": order_id, "reason": "order_not_eligible"},
+        )
         raise HTTPException(status_code=409, detail="Order not eligible for assignment")
 
     couriers = db.execute(
@@ -67,6 +92,11 @@ def match_order(order_id: str, db: Session = Depends(get_db)):
             best_meta = {"score": score, "explain": explain}
 
     if not best:
+        dispatch_failure.inc()
+        logger.info(
+            "dispatch_failure",
+            extra={"order_id": order_id, "reason": "no_available_couriers"},
+        )
         raise HTTPException(status_code=409, detail="No couriers available")
 
     assignment = Assignment(
@@ -85,9 +115,13 @@ def match_order(order_id: str, db: Session = Depends(get_db)):
     except IntegrityError:
         # Another request won the race → idempotent response
         db.rollback()
+        dispatch_failure.inc()
+        logger.info("dispatch_race_lost", extra={"order_id": order.id})
+
         winner = db.execute(
             select(Assignment).where(Assignment.order_id == order.id)
         ).scalar_one()
+
         return {
             "order_id": winner.order_id,
             "courier_id": winner.courier_id,
@@ -97,6 +131,17 @@ def match_order(order_id: str, db: Session = Depends(get_db)):
         }
 
     db.refresh(assignment)
+
+    dispatch_success.inc()
+    logger.info(
+        "dispatch_success",
+        extra={
+            "order_id": assignment.order_id,
+            "courier_id": assignment.courier_id,
+            "assignment_id": assignment.id,
+            "score": assignment.score,
+        },
+    )
 
     return {
         "order_id": assignment.order_id,
