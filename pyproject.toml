@@ -21,3 +21,8 @@ dev = [
   "httpx>=0.27",
   "ruff>=0.3",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = ["alembic/"]
