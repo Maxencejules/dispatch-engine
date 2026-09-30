@@ -1,49 +1,56 @@
 import os
 
 import pytest
+from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-from app.main import app
+from alembic import command
 from app.db import get_db
-from app.models import Base
-
-
-TEST_DB_URL = os.getenv(
-    "TEST_DATABASE_URL",
-    "postgresql+psycopg://dispatch:dispatch@localhost:5432/dispatch",
-)
+from app.main import app
 
 
 @pytest.fixture(scope="session")
 def engine():
-    engine = create_engine(TEST_DB_URL, pool_pre_ping=True)
-    return engine
-
-
-@pytest.fixture(scope="function")
-def db_session(engine):
-    Base.metadata.create_all(bind=engine)
-
-    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-    db = SessionLocal()
-
-    db.execute(text("TRUNCATE TABLE assignments, orders, couriers RESTART IDENTITY CASCADE;"))
-    db.commit()
-
+    url = os.getenv("TEST_DATABASE_URL")
+    if not url:
+        pytest.fail("Set TEST_DATABASE_URL to a dedicated disposable PostgreSQL database")
+    engine = create_engine(url, pool_pre_ping=True, isolation_level="READ COMMITTED")
+    assert engine.dialect.name == "postgresql"
+    config = Config("alembic.ini")
+    config.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "head")
     try:
-        yield db
+        yield engine
     finally:
-        db.close()
+        engine.dispose()
 
 
-@pytest.fixture(scope="function")
-def client(db_session):
+@pytest.fixture
+def db_session(engine):
+    with engine.begin() as connection:
+        connection.execute(text("TRUNCATE assignments, orders, couriers CASCADE"))
+    with sessionmaker(bind=engine, autoflush=False)() as db:
+        yield db
+    with engine.begin() as connection:
+        connection.execute(text("TRUNCATE assignments, orders, couriers CASCADE"))
+
+
+@pytest.fixture
+def client(engine, db_session):
+    sessions = sessionmaker(bind=engine, autoflush=False)
+
     def override_get_db():
-        yield db_session
+        # Every request owns its Session/transaction, including simultaneous requests.
+        with sessions() as db:
+            yield db
 
     app.dependency_overrides[get_db] = override_get_db
-    with TestClient(app) as c:
-        yield c
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            yield client
+    finally:
+        app.dependency_overrides.clear()

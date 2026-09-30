@@ -1,0 +1,12 @@
+# Tested direct dependencies. Transitive/platform dependencies follow their package requirements.
+fastapi==0.142.1
+uvicorn==0.54.0
+SQLAlchemy==2.1.1
+psycopg==3.3.6
+psycopg-binary==3.3.6
+alembic==1.20.0
+pydantic==2.13.5
+prometheus-client==0.26.0
+pytest==9.1.1
+httpx==0.28.1
+ruff==0.16.9

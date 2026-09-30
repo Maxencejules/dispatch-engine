@@ -1,6 +1,6 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
-from app.algorithms.scoring import MatchWeights, courier_score
+from app.algorithms.scoring import MatchWeights, courier_score, staleness_minutes
 
 
 def test_score_prefers_closer_courier():
@@ -13,7 +13,7 @@ def test_score_prefers_closer_courier():
         pickup_lng=0.1,
         active_assignments=0,
         capacity=1,
-        last_seen_at=datetime.now(timezone.utc),
+        last_seen_at=datetime.now(UTC),
         weights=weights,
     )
 
@@ -24,7 +24,7 @@ def test_score_prefers_closer_courier():
         pickup_lng=5.0,
         active_assignments=0,
         capacity=1,
-        last_seen_at=datetime.now(timezone.utc),
+        last_seen_at=datetime.now(UTC),
         weights=weights,
     )
 
@@ -41,7 +41,7 @@ def test_score_penalizes_load():
         pickup_lng=0.0,
         active_assignments=0,
         capacity=2,
-        last_seen_at=datetime.now(timezone.utc),
+        last_seen_at=datetime.now(UTC),
         weights=weights,
     )
 
@@ -52,7 +52,7 @@ def test_score_penalizes_load():
         pickup_lng=0.0,
         active_assignments=2,
         capacity=2,
-        last_seen_at=datetime.now(timezone.utc),
+        last_seen_at=datetime.now(UTC),
         weights=weights,
     )
 
@@ -62,7 +62,7 @@ def test_score_penalizes_load():
 def test_score_penalizes_staleness():
     weights = MatchWeights(w_distance=0.0, w_load=0.0, w_staleness=1.0)
 
-    fresh_time = datetime.now(timezone.utc)
+    fresh_time = datetime.now(UTC)
     stale_time = fresh_time - timedelta(minutes=30)
 
     fresh_score, _ = courier_score(
@@ -88,3 +88,7 @@ def test_score_penalizes_staleness():
     )
 
     assert fresh_score < stale_score
+
+
+def test_future_location_timestamp_does_not_reward_a_courier_with_negative_staleness():
+    assert staleness_minutes(datetime.now(UTC) + timedelta(hours=1)) == 0
