@@ -1,12 +1,12 @@
 import os
 
-from alembic import command
+import pytest
 from alembic.config import Config
 from fastapi.testclient import TestClient
-import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from alembic import command
 from app.db import get_db
 from app.main import app
 
@@ -20,7 +20,9 @@ def engine():
     assert engine.dialect.name == "postgresql"
     config = Config("alembic.ini")
     config.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
-    command.upgrade(config, "head")
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "head")
     try:
         yield engine
     finally:
@@ -33,6 +35,8 @@ def db_session(engine):
         connection.execute(text("TRUNCATE assignments, orders, couriers CASCADE"))
     with sessionmaker(bind=engine, autoflush=False)() as db:
         yield db
+    with engine.begin() as connection:
+        connection.execute(text("TRUNCATE assignments, orders, couriers CASCADE"))
 
 
 @pytest.fixture

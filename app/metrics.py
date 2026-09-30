@@ -14,3 +14,8 @@ dispatch_failure = Counter(
     "dispatch_failure_total",
     "Failed dispatches",
 )
+
+dispatch_replay = Counter(
+    "dispatch_replay_total",
+    "Successful replays of an existing assignment",
+)

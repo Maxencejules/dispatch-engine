@@ -1,7 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from uuid import UUID
 
-from app.db import get_db
+from fastapi import APIRouter
+
+from app.db import DbSession
+from app.errors import DispatchError
 from app.models import Order
 from app.schemas import OrderCreate, OrderResponse
 
@@ -9,7 +11,7 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 
 
 @router.post("", response_model=OrderResponse)
-def create_order(payload: OrderCreate, db: Session = Depends(get_db)):
+def create_order(payload: OrderCreate, db: DbSession):
     order = Order(
         pickup_lat=payload.pickup_lat,
         pickup_lng=payload.pickup_lng,
@@ -23,8 +25,8 @@ def create_order(payload: OrderCreate, db: Session = Depends(get_db)):
 
 
 @router.get("/{order_id}", response_model=OrderResponse)
-def get_order(order_id: str, db: Session = Depends(get_db)):
-    order = db.get(Order, order_id)
+def get_order(order_id: UUID, db: DbSession):
+    order = db.get(Order, str(order_id))
     if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+        raise DispatchError(404, "order_not_found", "Order not found")
     return order

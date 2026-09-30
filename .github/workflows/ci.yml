@@ -11,10 +11,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+        postgres: ["16", "17"]
     services:
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_DB: dispatch
           POSTGRES_USER: dispatch
@@ -26,35 +30,55 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
-
     env:
-      TEST_DATABASE_URL: postgresql+psycopg://dispatch:dispatch@localhost:5432/dispatch
-
+      TEST_DATABASE_URL: postgresql+psycopg://dispatch:dispatch@127.0.0.1:5432/dispatch
+      DATABASE_URL: postgresql+psycopg://dispatch:dispatch@127.0.0.1:5432/dispatch
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
-      - name: Install package (dev)
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            constraints.txt
+      - name: Install tested direct dependencies
+        run: python -m pip install -c constraints.txt -e ".[dev]"
+      - name: Lint
+        run: python -m ruff check .
+      - name: PostgreSQL transactions and legacy migration tests
+        run: python -m pytest -q --junitxml=reports/pytest.xml
+      - name: Build and import installed wheel outside checkout
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
-
-      - name: Lint (ruff)
+          python -m pip wheel --no-deps --wheel-dir reports/wheels .
+          python scripts/wheel_smoke.py reports/wheels/dispatch_engine-*.whl
+      - name: Real HTTP demo and API restart receipts
+        shell: bash
         run: |
-          python -m ruff check .
-
-      - name: Run tests
-        run: |
-          python -m pytest -q --junitxml=reports/pytest.xml
-
-      - name: Upload transaction regression proof
+          python -m alembic upgrade head
+          api_pid=""
+          cleanup() { if [ -n "$api_pid" ]; then kill "$api_pid" 2>/dev/null || true; wait "$api_pid" 2>/dev/null || true; fi; }
+          trap cleanup EXIT
+          start_api() {
+            python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 >>reports/api.log 2>&1 &
+            api_pid=$!
+            for attempt in $(seq 1 60); do
+              if curl --fail --silent http://127.0.0.1:8000/health >/dev/null; then return; fi
+              if ! kill -0 "$api_pid" 2>/dev/null; then cat reports/api.log; return 1; fi
+              sleep 1
+            done
+            cat reports/api.log
+            return 1
+          }
+          start_api
+          python scripts/http_demo.py
+          cleanup
+          api_pid=""
+          start_api
+          python scripts/http_demo.py --verify-receipts
+      - name: Upload verification evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dispatch-regression-proof
+          name: dispatch-proof-py${{ matrix.python }}-pg${{ matrix.postgres }}
           path: reports/

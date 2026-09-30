@@ -1,6 +1,8 @@
-from app.algorithms.distance import haversine_km
 import math
+
 import pytest
+
+from app.algorithms.distance import haversine_km
 
 
 def test_haversine_zero_distance():
@@ -19,6 +21,7 @@ def test_haversine_known_distance():
 
 
 def test_antipodal_rounding_does_not_raise_for_valid_coordinates():
-    distance = haversine_km(85.48732191913109, 6.157255195407856,
-                            -85.48732191913109, -173.84274480459214)
+    distance = haversine_km(
+        85.48732191913109, 6.157255195407856, -85.48732191913109, -173.84274480459214
+    )
     assert distance == pytest.approx(math.pi * 6371, abs=1e-7)

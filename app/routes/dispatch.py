@@ -1,153 +1,133 @@
 import logging
+from datetime import UTC, datetime
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
 
 from app.algorithms.scoring import courier_score
-from app.db import get_db
-from app.metrics import dispatch_attempts, dispatch_failure, dispatch_success
+from app.db import DbSession
+from app.errors import DispatchError
+from app.metrics import dispatch_attempts, dispatch_failure, dispatch_replay, dispatch_success
 from app.models import Assignment, Courier, CourierStatus, Order, OrderStatus
+from app.schemas import MatchResponse
 
 router = APIRouter(prefix="/dispatch", tags=["dispatch"])
 logger = logging.getLogger("dispatch")
 
 
-@router.post("/match")
-def match_order(order_id: str, db: Session = Depends(get_db)):
-    dispatch_attempts.inc()
-    logger.info("dispatch_attempt", extra={"order_id": order_id})
-
-    # Lock the order row to prevent races
-    order = db.execute(
-        select(Order).where(Order.id == order_id).with_for_update()
-    ).scalar_one_or_none()
-
-    if not order:
-        dispatch_failure.inc()
-        logger.info(
-            "dispatch_failure",
-            extra={"order_id": order_id, "reason": "order_not_found"},
-        )
-        raise HTTPException(status_code=404, detail="Order not found")
-
-    # Idempotency: return existing assignment if already assigned
-    existing = db.execute(
-        select(Assignment).where(Assignment.order_id == order.id)
-    ).scalar_one_or_none()
-
-    if existing:
-        logger.info(
-            "dispatch_idempotent_hit",
-            extra={
-                "order_id": existing.order_id,
-                "courier_id": existing.courier_id,
-                "assignment_id": existing.id,
-            },
-        )
-        return {
-            "order_id": existing.order_id,
-            "courier_id": existing.courier_id,
-            "assignment_id": existing.id,
-            "score": existing.score,
-            "idempotent": True,
-        }
-
-    if order.status != OrderStatus.unassigned:
-        dispatch_failure.inc()
-        logger.info(
-            "dispatch_failure",
-            extra={"order_id": order_id, "reason": "order_not_eligible"},
-        )
-        raise HTTPException(status_code=409, detail="Order not eligible for assignment")
-
-    couriers = db.execute(
-        select(Courier).where(Courier.status == CourierStatus.available)
-    ).scalars().all()
-
-    best = None
-    best_meta = None
-
-    for c in couriers:
-        active_count = db.execute(
-            select(func.count(Assignment.id)).where(Assignment.courier_id == c.id)
-        ).scalar_one()
-
-        if active_count >= c.capacity:
-            continue
-
-        score, explain = courier_score(
-            courier_lat=c.lat,
-            courier_lng=c.lng,
-            pickup_lat=order.pickup_lat,
-            pickup_lng=order.pickup_lng,
-            active_assignments=active_count,
-            capacity=c.capacity,
-            last_seen_at=c.last_seen_at,
-        )
-
-        if best is None or score < best_meta["score"]:
-            best = c
-            best_meta = {"score": score, "explain": explain}
-
-    if not best:
-        dispatch_failure.inc()
-        logger.info(
-            "dispatch_failure",
-            extra={"order_id": order_id, "reason": "no_available_couriers"},
-        )
-        raise HTTPException(status_code=409, detail="No couriers available")
-
-    assignment = Assignment(
-        order_id=order.id,
-        courier_id=best.id,
-        score=best_meta["score"],
-        reason="transactional_min_score",
+def receipt(assignment: Assignment, *, idempotent: bool) -> MatchResponse:
+    return MatchResponse(
+        order_id=assignment.order_id,
+        courier_id=assignment.courier_id,
+        assignment_id=assignment.id,
+        score=assignment.score,
+        assigned_at=assignment.assigned_at.astimezone(UTC),
+        reason=assignment.reason,
+        explain=assignment.explain,
+        idempotent=idempotent,
     )
 
-    order.status = OrderStatus.assigned
-    best.status = CourierStatus.assigned
 
+@router.post("/match", response_model=MatchResponse)
+def match_order(order_id: UUID, db: DbSession):
+    dispatch_attempts.inc()
+    identifier = str(order_id)
     try:
+        # Lock order first, then eligible couriers in ascending immutable ID order.
+        # Every assignment and status/location writer follows this same courier lock protocol.
+        order = db.scalar(select(Order).where(Order.id == identifier).with_for_update())
+        if order is None:
+            raise DispatchError(404, "order_not_found", "Order not found")
+        existing = db.scalar(select(Assignment).where(Assignment.order_id == identifier))
+        if existing is not None:
+            result = receipt(existing, idempotent=True)
+            db.commit()
+            dispatch_replay.inc()
+            return result
+        if order.status != OrderStatus.unassigned:
+            raise DispatchError(409, "order_not_eligible", "Order not eligible for assignment")
+
+        couriers = list(
+            db.scalars(
+                select(Courier)
+                .where(Courier.status == CourierStatus.available)
+                .order_by(Courier.id)
+                .with_for_update()
+            )
+        )
+        # READ COMMITTED gives this post-lock statement a fresh snapshot after a winner commits.
+        loads = dict(
+            db.execute(
+                select(Assignment.courier_id, func.count(Assignment.id))
+                .where(Assignment.courier_id.in_([courier.id for courier in couriers]))
+                .group_by(Assignment.courier_id)
+            ).all()
+        )
+        best = None
+        best_score = None
+        best_explain = None
+        now = datetime.now(UTC)
+        for courier in couriers:
+            reserved = loads.get(courier.id, 0)
+            if reserved >= courier.capacity:
+                continue
+            score, explain = courier_score(
+                courier_lat=courier.lat,
+                courier_lng=courier.lng,
+                pickup_lat=order.pickup_lat,
+                pickup_lng=order.pickup_lng,
+                active_assignments=reserved,
+                capacity=courier.capacity,
+                last_seen_at=courier.last_seen_at,
+                now=now,
+            )
+            # Sorted IDs break exact score ties, with one shared clock across candidates.
+            if best is None or score < best_score:
+                best, best_score, best_explain = courier, score, explain
+        if best is None:
+            raise DispatchError(409, "no_couriers_available", "No couriers available")
+
+        assignment = Assignment(
+            order_id=identifier,
+            courier_id=best.id,
+            score=best_score,
+            reason="transactional_min_score",
+            explain=best_explain,
+        )
         db.add(assignment)
-        db.commit()
-    except IntegrityError:
-        # Another request won the race → idempotent response
+        order.status = OrderStatus.assigned
+        if loads.get(best.id, 0) + 1 >= best.capacity:
+            best.status = CourierStatus.assigned
+        try:
+            db.commit()
+        except IntegrityError as error:
+            db.rollback()
+            original = error.orig
+            # Recover only the existing PostgreSQL order uniqueness guard; other failures stay errors.
+            if (
+                getattr(original, "sqlstate", None) == "23505"
+                and getattr(getattr(original, "diag", None), "constraint_name", None)
+                == "assignments_order_id_key"
+            ):
+                winner = db.scalar(select(Assignment).where(Assignment.order_id == identifier))
+                if winner is not None:
+                    result = receipt(winner, idempotent=True)
+                    db.commit()
+                    dispatch_replay.inc()
+                    return result
+            raise
+        db.refresh(assignment)
+        dispatch_success.inc()
+        logger.info(
+            "dispatch_success order_id=%s courier_id=%s assignment_id=%s",
+            identifier,
+            assignment.courier_id,
+            assignment.id,
+        )
+        return receipt(assignment, idempotent=False)
+    except Exception:
         db.rollback()
         dispatch_failure.inc()
-        logger.info("dispatch_race_lost", extra={"order_id": order.id})
-
-        winner = db.execute(
-            select(Assignment).where(Assignment.order_id == order.id)
-        ).scalar_one()
-
-        return {
-            "order_id": winner.order_id,
-            "courier_id": winner.courier_id,
-            "assignment_id": winner.id,
-            "score": winner.score,
-            "idempotent": True,
-        }
-
-    db.refresh(assignment)
-
-    dispatch_success.inc()
-    logger.info(
-        "dispatch_success",
-        extra={
-            "order_id": assignment.order_id,
-            "courier_id": assignment.courier_id,
-            "assignment_id": assignment.id,
-            "score": assignment.score,
-        },
-    )
-
-    return {
-        "order_id": assignment.order_id,
-        "courier_id": assignment.courier_id,
-        "assignment_id": assignment.id,
-        "score": assignment.score,
-        "explain": best_meta["explain"],
-        "idempotent": False,
-    }
+        raise

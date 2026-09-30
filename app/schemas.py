@@ -1,23 +1,26 @@
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict
+from typing import Annotated
 
+from pydantic import BaseModel, ConfigDict, Field
 
-# -------- Couriers --------
+Latitude = Annotated[float, Field(ge=-90, le=90, allow_inf_nan=False, strict=True)]
+Longitude = Annotated[float, Field(ge=-180, le=180, allow_inf_nan=False, strict=True)]
+Capacity = Annotated[int, Field(ge=1, le=2_147_483_647, strict=True)]
+
 
 class CourierCreate(BaseModel):
-    lat: float
-    lng: float
-    capacity: int = 1
+    lat: Latitude
+    lng: Longitude
+    capacity: Capacity = 1
 
 
 class CourierUpdateLocation(BaseModel):
-    lat: float
-    lng: float
+    lat: Latitude
+    lng: Longitude
 
 
 class CourierResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-
     id: str
     status: str
     lat: float
@@ -26,18 +29,15 @@ class CourierResponse(BaseModel):
     last_seen_at: datetime
 
 
-# -------- Orders --------
-
 class OrderCreate(BaseModel):
-    pickup_lat: float
-    pickup_lng: float
-    dropoff_lat: float
-    dropoff_lng: float
+    pickup_lat: Latitude
+    pickup_lng: Longitude
+    dropoff_lat: Latitude
+    dropoff_lng: Longitude
 
 
 class OrderResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-
     id: str
     status: str
     pickup_lat: float
@@ -45,3 +45,14 @@ class OrderResponse(BaseModel):
     dropoff_lat: float
     dropoff_lng: float
     created_at: datetime
+
+
+class MatchResponse(BaseModel):
+    order_id: str
+    courier_id: str
+    assignment_id: str
+    score: float
+    assigned_at: datetime
+    reason: str
+    explain: dict[str, float] | None
+    idempotent: bool
