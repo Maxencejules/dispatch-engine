@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from app.algorithms.scoring import MatchWeights, courier_score
+from app.algorithms.scoring import MatchWeights, courier_score, staleness_minutes
 
 
 def test_score_prefers_closer_courier():
@@ -88,3 +88,7 @@ def test_score_penalizes_staleness():
     )
 
     assert fresh_score < stale_score
+
+
+def test_future_location_timestamp_does_not_reward_a_courier_with_negative_staleness():
+    assert staleness_minutes(datetime.now(timezone.utc) + timedelta(hours=1)) == 0
